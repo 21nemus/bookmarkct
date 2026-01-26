@@ -4,9 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import { keccak256, toBytes } from "viem";
 import {
   useAccount,
+  useChainId,
   useConnect,
   useDisconnect,
   usePublicClient,
+  useSwitchChain,
   useWriteContract,
 } from "wagmi";
 
@@ -36,13 +38,14 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [txStates, setTxStates] = useState<Record<string, TxState>>({});
-  const [walletError, setWalletError] = useState<string | null>(null);
 
   const { address, isConnected } = useAccount();
+  const chainId = useChainId();
   const { connect, connectors, isPending: isConnecting, error: connectError } =
     useConnect();
   const { disconnect } = useDisconnect();
-
+  const { switchChainAsync, isPending: isSwitching, error: switchError } =
+    useSwitchChain();
   const publicClient = usePublicClient({ chainId: onchainConfig.chainId });
   const { writeContractAsync } = useWriteContract();
 
@@ -58,11 +61,7 @@ export default function Home() {
   const loadBookmarks = async () => {
     try {
       const response = await fetch("/api/bookmarks", { cache: "no-store" });
-
-      if (!response.ok) {
-        throw new Error("Failed to load bookmarks.");
-      }
-
+      if (!response.ok) throw new Error("Failed to load bookmarks.");
       const data = (await response.json()) as Bookmark[];
       setBookmarks(data);
     } catch (fetchError) {
@@ -75,31 +74,22 @@ export default function Home() {
     void loadBookmarks();
   }, []);
 
-  const pickMetaMaskConnector = () => {
-    const byName = connectors.find((c) =>
-      (c.name ?? "").toLowerCase().includes("metamask")
+  const preferredConnector = useMemo(() => {
+    // injected({ target: "metaMask" }) heißt in der UI typischerweise "MetaMask"
+    const metaMaskLike = connectors.find(
+      (c) => (c.name || "").toLowerCase() === "metamask"
     );
-    if (byName) return byName;
+    return metaMaskLike ?? connectors[0];
+  }, [connectors]);
 
-    const byId = connectors.find((c) =>
-      (c.id ?? "").toLowerCase().includes("metamask")
-    );
-    if (byId) return byId;
-
-    return undefined;
-  };
-
-  const handleConnectWallet = () => {
-    setWalletError(null);
-
-    const mm = pickMetaMaskConnector();
-
-    if (!mm) {
-      setWalletError("MetaMask not detected. Please install/enable MetaMask.");
-      return;
+  const ensureBscTestnet = async () => {
+    if (chainId === onchainConfig.chainId) return;
+    if (!switchChainAsync) {
+      throw new Error(
+        `Wrong network. Please switch to BSC Testnet (chainId ${onchainConfig.chainId}).`
+      );
     }
-
-    connect({ connector: mm });
+    await switchChainAsync({ chainId: onchainConfig.chainId });
   };
 
   const handleSaveOnchain = async (bookmark: Bookmark) => {
@@ -120,6 +110,9 @@ export default function Home() {
     }));
 
     try {
+      // Fix für deinen Error: wenn Wallet auf Chain 1 ist, zuerst auf 97 wechseln
+      await ensureBscTestnet();
+
       const summaryHash = keccak256(toBytes(bookmark.summary));
       const summaryPreview = bookmark.summary.slice(0, MAX_SUMMARY_PREVIEW);
 
@@ -146,9 +139,7 @@ export default function Home() {
       }));
     } catch (txError) {
       const message =
-        txError instanceof Error
-          ? txError.message
-          : "Failed to submit transaction.";
+        txError instanceof Error ? txError.message : "Failed to submit transaction.";
       setTxStates((prev) => ({
         ...prev,
         [bookmark.id]: { status: "error", error: message },
@@ -215,6 +206,7 @@ export default function Home() {
                 Connect MetaMask on BNB Smart Chain Testnet.
               </p>
             </div>
+
             <div className="flex flex-wrap items-center gap-3">
               {isConnected ? (
                 <>
@@ -232,7 +224,14 @@ export default function Home() {
               ) : (
                 <button
                   type="button"
-                  onClick={handleConnectWallet}
+                  onClick={() => {
+                    setError(null);
+                    if (!preferredConnector) {
+                      setError("No injected wallet found. Enable MetaMask extension.");
+                      return;
+                    }
+                    connect({ connector: preferredConnector });
+                  }}
                   disabled={isConnecting}
                   className="rounded-full bg-zinc-900 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-70"
                 >
@@ -246,14 +245,28 @@ export default function Home() {
             <p className="mt-3 text-xs text-red-600">{connectError.message}</p>
           ) : null}
 
-          {walletError ? (
-            <p className="mt-3 text-xs text-red-600">{walletError}</p>
+          {switchError ? (
+            <p className="mt-3 text-xs text-red-600">{switchError.message}</p>
           ) : null}
 
           {!isContractConfigured ? (
-            <p className="mt-3 text-sm text-amber-700">
-              Deploy the contract first.
-            </p>
+            <p className="mt-3 text-sm text-amber-700">Deploy the contract first.</p>
+          ) : null}
+
+          {isConnected && chainId !== onchainConfig.chainId ? (
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <p className="text-sm text-amber-700">
+                Wrong network. Please switch to BSC Testnet.
+              </p>
+              <button
+                type="button"
+                onClick={() => switchChainAsync({ chainId: onchainConfig.chainId })}
+                disabled={isSwitching}
+                className="rounded-full border border-zinc-200 px-4 py-2 text-xs font-semibold text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isSwitching ? "Switching..." : "Switch Network"}
+              </button>
+            </div>
           ) : null}
         </section>
 
@@ -330,9 +343,7 @@ export default function Home() {
         <section className="space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold">Saved bookmarks</h2>
-            <span className="text-sm text-zinc-500">
-              {bookmarks.length} total
-            </span>
+            <span className="text-sm text-zinc-500">{bookmarks.length} total</span>
           </div>
 
           {bookmarks.length === 0 ? (
@@ -347,10 +358,9 @@ export default function Home() {
                   className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm"
                 >
                   <p className="text-sm text-zinc-700">{bookmark.summary}</p>
+
                   <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-zinc-500">
-                    <span>
-                      {new Date(bookmark.createdAt).toLocaleString()}
-                    </span>
+                    <span>{new Date(bookmark.createdAt).toLocaleString()}</span>
                     {bookmark.sourceUrl ? (
                       <a
                         href={bookmark.sourceUrl}
@@ -391,9 +401,7 @@ export default function Home() {
                     {txStates[bookmark.id]?.status === "success" ? (
                       <a
                         className="text-xs text-emerald-700 underline decoration-emerald-300 underline-offset-4"
-                        href={`https://testnet.bscscan.com/tx/${txStates[
-                          bookmark.id
-                        ]?.hash}`}
+                        href={`https://testnet.bscscan.com/tx/${txStates[bookmark.id]?.hash}`}
                         target="_blank"
                         rel="noreferrer"
                       >
