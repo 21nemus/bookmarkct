@@ -1,0 +1,35 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_20-2c98708f54d5a7353066581b76bd3b059f2442df",
+  "solcVersion": "0.8.20",
+  "solcLongVersion": "0.8.20+commit.a1b79de6",
+  "userSourceNameMap": {
+    "contracts/BookmarkCT.sol": "project/contracts/BookmarkCT.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "shanghai",
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode",
+            "evm.deployedBytecode",
+            "evm.methodIdentifiers",
+            "metadata"
+          ]
+        }
+      },
+      "remappings": []
+    },
+    "sources": {
+      "project/contracts/BookmarkCT.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract BookmarkCT {\n    struct Bookmark {\n        address owner;\n        string sourceUrl;\n        bytes32 summaryHash;\n        string summaryPreview;\n        uint256 createdAt;\n    }\n\n    Bookmark[] private bookmarks;\n\n    event BookmarkCreated(\n        uint256 id,\n        address owner,\n        string sourceUrl,\n        bytes32 summaryHash,\n        string summaryPreview,\n        uint256 createdAt\n    );\n\n    function createBookmark(\n        string calldata sourceUrl,\n        bytes32 summaryHash,\n        string calldata summaryPreview\n    ) external {\n        require(bytes(summaryPreview).length <= 200, \"Summary preview too long\");\n\n        Bookmark memory newBookmark = Bookmark({\n            owner: msg.sender,\n            sourceUrl: sourceUrl,\n            summaryHash: summaryHash,\n            summaryPreview: summaryPreview,\n            createdAt: block.timestamp\n        });\n\n        bookmarks.push(newBookmark);\n\n        emit BookmarkCreated(\n            bookmarks.length - 1,\n            msg.sender,\n            sourceUrl,\n            summaryHash,\n            summaryPreview,\n            block.timestamp\n        );\n    }\n\n    function getBookmark(uint256 id) external view returns (Bookmark memory) {\n        require(id < bookmarks.length, \"Bookmark not found\");\n        return bookmarks[id];\n    }\n\n    function count() external view returns (uint256) {\n        return bookmarks.length;\n    }\n}\n"
+      }
+    }
+  }
+}
