@@ -1,6 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { keccak256, toBytes } from "viem";
+import {
+  useAccount,
+  useConnect,
+  useDisconnect,
+  usePublicClient,
+  useWriteContract,
+} from "wagmi";
+
+import onchainConfig from "@/lib/onchain/bookmarkct.testnet.json";
 
 type Bookmark = {
   id: string;
@@ -11,6 +21,13 @@ type Bookmark = {
 };
 
 const MAX_SOURCE_TEXT_LENGTH = 10_000;
+const MAX_SUMMARY_PREVIEW = 200;
+
+type TxState = {
+  status: "idle" | "wallet" | "pending" | "success" | "error";
+  hash?: `0x${string}`;
+  error?: string;
+};
 
 export default function Home() {
   const [sourceText, setSourceText] = useState("");
@@ -18,6 +35,20 @@ export default function Home() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [txStates, setTxStates] = useState<Record<string, TxState>>({});
+  const [walletError, setWalletError] = useState<string | null>(null);
+
+  const { address, isConnected } = useAccount();
+  const { connect, connectors, isPending: isConnecting, error: connectError } =
+    useConnect();
+  const { disconnect } = useDisconnect();
+
+  const publicClient = usePublicClient({ chainId: onchainConfig.chainId });
+  const { writeContractAsync } = useWriteContract();
+
+  const contractAddress =
+    typeof onchainConfig.address === "string" ? onchainConfig.address : "";
+  const isContractConfigured = Boolean(contractAddress);
 
   const remainingChars = useMemo(
     () => MAX_SOURCE_TEXT_LENGTH - sourceText.length,
@@ -43,6 +74,87 @@ export default function Home() {
   useEffect(() => {
     void loadBookmarks();
   }, []);
+
+  const pickMetaMaskConnector = () => {
+    const byName = connectors.find((c) =>
+      (c.name ?? "").toLowerCase().includes("metamask")
+    );
+    if (byName) return byName;
+
+    const byId = connectors.find((c) =>
+      (c.id ?? "").toLowerCase().includes("metamask")
+    );
+    if (byId) return byId;
+
+    return undefined;
+  };
+
+  const handleConnectWallet = () => {
+    setWalletError(null);
+
+    const mm = pickMetaMaskConnector();
+
+    if (!mm) {
+      setWalletError("MetaMask not detected. Please install/enable MetaMask.");
+      return;
+    }
+
+    connect({ connector: mm });
+  };
+
+  const handleSaveOnchain = async (bookmark: Bookmark) => {
+    if (!isConnected) {
+      setError("Connect your wallet to save on-chain.");
+      return;
+    }
+
+    if (!isContractConfigured) {
+      setError("Deploy the contract first.");
+      return;
+    }
+
+    setError(null);
+    setTxStates((prev) => ({
+      ...prev,
+      [bookmark.id]: { status: "wallet" },
+    }));
+
+    try {
+      const summaryHash = keccak256(toBytes(bookmark.summary));
+      const summaryPreview = bookmark.summary.slice(0, MAX_SUMMARY_PREVIEW);
+
+      const hash = await writeContractAsync({
+        address: contractAddress as `0x${string}`,
+        abi: onchainConfig.abi,
+        functionName: "createBookmark",
+        args: [bookmark.sourceUrl ?? "", summaryHash, summaryPreview],
+        chainId: onchainConfig.chainId,
+      });
+
+      setTxStates((prev) => ({
+        ...prev,
+        [bookmark.id]: { status: "pending", hash },
+      }));
+
+      if (publicClient) {
+        await publicClient.waitForTransactionReceipt({ hash });
+      }
+
+      setTxStates((prev) => ({
+        ...prev,
+        [bookmark.id]: { status: "success", hash },
+      }));
+    } catch (txError) {
+      const message =
+        txError instanceof Error
+          ? txError.message
+          : "Failed to submit transaction.";
+      setTxStates((prev) => ({
+        ...prev,
+        [bookmark.id]: { status: "error", error: message },
+      }));
+    }
+  };
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -95,6 +207,56 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-zinc-50 px-4 py-10 text-zinc-900 sm:px-8 lg:px-16">
       <main className="mx-auto flex w-full max-w-3xl flex-col gap-10">
+        <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold">Wallet</h2>
+              <p className="text-sm text-zinc-600">
+                Connect MetaMask on BNB Smart Chain Testnet.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              {isConnected ? (
+                <>
+                  <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs text-zinc-700">
+                    {address}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => disconnect()}
+                    className="rounded-full border border-zinc-200 px-4 py-2 text-xs font-semibold text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
+                  >
+                    Disconnect
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleConnectWallet}
+                  disabled={isConnecting}
+                  className="rounded-full bg-zinc-900 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isConnecting ? "Connecting..." : "Connect Wallet"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {connectError ? (
+            <p className="mt-3 text-xs text-red-600">{connectError.message}</p>
+          ) : null}
+
+          {walletError ? (
+            <p className="mt-3 text-xs text-red-600">{walletError}</p>
+          ) : null}
+
+          {!isContractConfigured ? (
+            <p className="mt-3 text-sm text-amber-700">
+              Deploy the contract first.
+            </p>
+          ) : null}
+        </section>
+
         <header className="space-y-3">
           <h1 className="text-3xl font-semibold tracking-tight">
             Bookmark summarizer
@@ -198,6 +360,51 @@ export default function Home() {
                       >
                         {bookmark.sourceUrl}
                       </a>
+                    ) : null}
+                  </div>
+
+                  <div className="mt-4 flex flex-col gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSaveOnchain(bookmark)}
+                      disabled={
+                        !isConnected ||
+                        !isContractConfigured ||
+                        txStates[bookmark.id]?.status === "wallet" ||
+                        txStates[bookmark.id]?.status === "pending"
+                      }
+                      className="inline-flex items-center justify-center rounded-xl border border-zinc-200 px-4 py-2 text-xs font-semibold text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Save on-chain
+                    </button>
+
+                    {txStates[bookmark.id]?.status === "wallet" ? (
+                      <span className="text-xs text-zinc-500">
+                        Confirm in wallet…
+                      </span>
+                    ) : null}
+
+                    {txStates[bookmark.id]?.status === "pending" ? (
+                      <span className="text-xs text-zinc-500">Pending…</span>
+                    ) : null}
+
+                    {txStates[bookmark.id]?.status === "success" ? (
+                      <a
+                        className="text-xs text-emerald-700 underline decoration-emerald-300 underline-offset-4"
+                        href={`https://testnet.bscscan.com/tx/${txStates[
+                          bookmark.id
+                        ]?.hash}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        View transaction on BscScan
+                      </a>
+                    ) : null}
+
+                    {txStates[bookmark.id]?.status === "error" ? (
+                      <span className="text-xs text-red-600">
+                        {txStates[bookmark.id]?.error ?? "Transaction failed."}
+                      </span>
                     ) : null}
                   </div>
                 </article>
