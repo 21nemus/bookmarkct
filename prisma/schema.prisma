@@ -16,4 +16,9 @@ model Bookmark {
   summary    String
   sourceUrl  String?
   createdAt  DateTime @default(now())
+
+  // X import metadata (optional)
+  tweetId        String?
+  tweetAuthorId  String?
+  tweetCreatedAt DateTime?
 }
