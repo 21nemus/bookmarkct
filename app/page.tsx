@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { keccak256, toBytes } from "viem";
 import {
   useAccount,
@@ -45,62 +45,135 @@ type TweetMeta = {
   tweetCreatedAt: string | null;
 };
 
-const MAX_SOURCE_TEXT_LENGTH = 10_000;
-const MAX_SUMMARY_PREVIEW = 200;
-
 type TxState = {
   status: "idle" | "wallet" | "pending" | "success" | "error";
   hash?: `0x${string}`;
   error?: string;
 };
 
+const MAX_SOURCE_TEXT_LENGTH = 10_000;
+const MAX_SUMMARY_PREVIEW = 200;
+
 function isMetaMaskInstalled(): boolean {
   if (typeof window === "undefined") return false;
   const anyWindow = window as unknown as { ethereum?: any };
   const eth = anyWindow.ethereum;
   if (!eth) return false;
-
   if (Array.isArray(eth.providers)) {
     return eth.providers.some((p: any) => p?.isMetaMask);
   }
-
   return Boolean(eth.isMetaMask);
 }
 
-function cx(...classes: Array<string | false | null | undefined>) {
-  return classes.filter(Boolean).join(" ");
+function formatCreatedAt(value: string): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toISOString().replace("T", " ").slice(0, 19);
 }
 
-function shortenUrl(raw: string, max = 48) {
+function shortHost(url: string): string {
   try {
-    const u = new URL(raw);
-    const s = `${u.hostname}${u.pathname}${u.search}`;
-    if (s.length <= max) return s;
-    return s.slice(0, Math.max(0, max - 1)) + "…";
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, "");
   } catch {
-    if (raw.length <= max) return raw;
-    return raw.slice(0, Math.max(0, max - 1)) + "…";
+    return url;
   }
 }
 
-function formatCreatedAtIso(createdAt: string) {
-  const created = new Date(createdAt).toISOString().replace("T", " ").slice(0, 19);
-  return created;
+function clampText(text: string, maxChars: number): string {
+  const t = (text ?? "").trim();
+  if (t.length <= maxChars) return t;
+  return t.slice(0, maxChars).trimEnd() + "…";
+}
+
+function classifySource(bookmark: {
+  sourceUrl: string | null;
+  sourceText: string;
+  tweetId?: string | null;
+}): { kind: "tweet" | "thread" | "article" | "text"; label: string } {
+  const url = (bookmark.sourceUrl ?? "").toLowerCase();
+
+  if (
+    url.includes("/i/articles/") ||
+    url.includes("/i/article/") ||
+    url.includes("x.com/i/articles") ||
+    url.includes("x.com/i/article")
+  ) {
+    return { kind: "article", label: "Article" };
+  }
+
+  if (url.includes("x.com/") && url.includes("/status/")) {
+    const text = bookmark.sourceText || "";
+    const lines = text.split("\n").filter((l) => l.trim().length > 0);
+    const hasManyLines = lines.length >= 5;
+    const hasThreadMarkers =
+      /\bthread\b/i.test(text) ||
+      /\b1\/(\d{1,2})\b/.test(text) ||
+      /\b2\/(\d{1,2})\b/.test(text) ||
+      text.includes("\n\n") ||
+      text.includes("\n• ") ||
+      text.includes("\n- ");
+
+    if (hasManyLines && hasThreadMarkers) {
+      return { kind: "thread", label: "Thread" };
+    }
+    return { kind: "tweet", label: "Tweet" };
+  }
+
+  if (!bookmark.sourceUrl) return { kind: "text", label: "Text" };
+  return { kind: "article", label: "Link" };
+}
+
+function truncateAddress(addr?: string): string {
+  if (!addr) return "";
+  if (addr.length < 10) return addr;
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
+
+function cx(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
+function navPill(active: boolean) {
+  return cx(
+    "rounded-full px-3 py-1.5 text-xs transition",
+    active
+      ? "bg-white text-zinc-900"
+      : "bg-white/5 soft-border text-zinc-200 hover:bg-white/10"
+  );
 }
 
 export default function Home() {
+  const heroRef = useRef<HTMLElement | null>(null);
+  const actionRef = useRef<HTMLElement | null>(null);
+  const vaultRef = useRef<HTMLElement | null>(null);
+  const [activeSection, setActiveSection] = useState<"hero" | "summarize" | "vault">("hero");
+  const [mode, setMode] = useState<"x" | "text">("x");
   const [sourceText, setSourceText] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
   const [tweetUrl, setTweetUrl] = useState("");
+  const [tweetMeta, setTweetMeta] = useState<TweetMeta | null>(null);
+
   const [importError, setImportError] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-
-  const [tweetMeta, setTweetMeta] = useState<TweetMeta | null>(null);
 
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [txStates, setTxStates] = useState<Record<string, TxState>>({});
+
+  const [expandedById, setExpandedById] = useState<Record<string, boolean>>({});
+  const toggleExpanded = (id: string) =>
+    setExpandedById((prev) => ({ ...prev, [id]: !prev[id] }));
+
+  const [activeFilter, setActiveFilter] = useState<
+    "all" | "tweet" | "thread" | "article" | "text"
+  >("all");
+  const [query, setQuery] = useState("");
+
+  const remainingChars = useMemo(
+    () => MAX_SOURCE_TEXT_LENGTH - sourceText.length,
+    [sourceText.length]
+  );
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -120,10 +193,9 @@ export default function Home() {
   const expectedChainId = onchainConfig.chainId;
   const isOnExpectedChain = chainId === expectedChainId;
 
-  const remainingChars = useMemo(
-    () => MAX_SOURCE_TEXT_LENGTH - sourceText.length,
-    [sourceText.length]
-  );
+  const scrollTo = (ref: React.RefObject<HTMLElement | null>) => {
+    ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   const loadBookmarks = async () => {
     try {
@@ -131,54 +203,124 @@ export default function Home() {
       if (!response.ok) throw new Error("Failed to load bookmarks.");
       const data = (await response.json()) as Bookmark[];
       setBookmarks(data);
-    } catch (fetchError) {
-      console.error(fetchError);
-      setError("Unable to load bookmarks. Please try again.");
+    } catch {
+      setError("Unable to load bookmarks.");
     }
   };
 
   useEffect(() => {
     void loadBookmarks();
   }, []);
-
+  useEffect(() => {
+    const hero = heroRef.current;
+    const action = actionRef.current;
+    const vault = vaultRef.current;
+  
+    if (!hero || !action || !vault) return;
+  
+    const entriesToSection = (target: Element): "hero" | "summarize" | "vault" => {
+      if (target === hero) return "hero";
+      if (target === action) return "summarize";
+      return "vault";
+    };
+  
+    const obs = new IntersectionObserver(
+      (entries) => {
+        // Nimm das Element mit der höchsten Sichtbarkeit
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => (b.intersectionRatio ?? 0) - (a.intersectionRatio ?? 0))[0];
+  
+        if (!visible?.target) return;
+        setActiveSection(entriesToSection(visible.target));
+      },
+      {
+        root: null,
+        // Header ist sticky, daher top margin
+        rootMargin: "-120px 0px -65% 0px",
+        threshold: [0.05, 0.15, 0.3, 0.5, 0.8],
+      }
+    );
+  
+    obs.observe(hero);
+    obs.observe(action);
+    obs.observe(vault);
+  
+    return () => obs.disconnect();
+  }, []);
   const handleImportFromX = async () => {
     setImportError(null);
     setError(null);
 
-    const trimmed = tweetUrl.trim();
-    if (!trimmed) {
-      setImportError("Paste an X/Twitter status URL first.");
+    if (!tweetUrl.trim()) {
+      setImportError("Paste an X status URL first.");
       return;
     }
 
     setIsImporting(true);
     try {
-      const res = await fetch(`/api/tweet?url=${encodeURIComponent(trimmed)}`, {
-        cache: "no-store",
-      });
-
+      const res = await fetch(`/api/tweet?url=${encodeURIComponent(tweetUrl)}`);
       const payload = (await res.json()) as TweetApiOk | TweetApiErr;
 
       if (!res.ok || !payload.ok) {
-        const msg =
-          "ok" in payload ? "Import failed." : (payload.error ?? "Import failed.");
-        throw new Error(msg);
+        throw new Error(
+          "ok" in payload ? "Import failed." : payload.error ?? "Import failed."
+        );
       }
 
       setSourceText(payload.text);
       setSourceUrl(payload.url);
-
       setTweetMeta({
         tweetId: payload.id,
-        tweetAuthorId: payload.authorId ?? null,
-        tweetCreatedAt: payload.createdAt ?? null,
+        tweetAuthorId: payload.authorId,
+        tweetCreatedAt: payload.createdAt,
       });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Import failed.";
-      setImportError(msg);
+      setImportError(e instanceof Error ? e.message : "Import failed.");
       setTweetMeta(null);
     } finally {
       setIsImporting(false);
+    }
+  };
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError(null);
+
+    const text = sourceText.trim();
+    if (!text) {
+      setError("Source text is required.");
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const res = await fetch("/api/bookmarks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceText: text,
+          sourceUrl: sourceUrl || undefined,
+          tweetId: tweetMeta?.tweetId,
+          tweetAuthorId: tweetMeta?.tweetAuthorId,
+          tweetCreatedAt: tweetMeta?.tweetCreatedAt,
+        }),
+      });
+
+      if (!res.ok) {
+        const payload = (await res.json()) as { error?: string };
+        throw new Error(payload.error ?? "Failed to create bookmark.");
+      }
+
+      setSourceText("");
+      setSourceUrl("");
+      setTweetUrl("");
+      setTweetMeta(null);
+      await loadBookmarks();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -187,22 +329,17 @@ export default function Home() {
       setError("Connect your wallet to save on-chain.");
       return;
     }
-
     if (!isContractConfigured) {
       setError("Deploy the contract first.");
       return;
     }
-
     if (!isOnExpectedChain) {
       setError("Switch your wallet to BNB Smart Chain Testnet (chainId 97).");
       return;
     }
 
     setError(null);
-    setTxStates((prev) => ({
-      ...prev,
-      [bookmark.id]: { status: "wallet" },
-    }));
+    setTxStates((prev) => ({ ...prev, [bookmark.id]: { status: "wallet" } }));
 
     try {
       const summaryHash = keccak256(toBytes(bookmark.summary));
@@ -239,76 +376,18 @@ export default function Home() {
     }
   };
 
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setError(null);
-
-    const trimmedText = sourceText.trim();
-    if (!trimmedText) {
-      setError("Source text is required.");
-      return;
-    }
-
-    if (trimmedText.length > MAX_SOURCE_TEXT_LENGTH) {
-      setError("Source text exceeds the maximum length.");
-      return;
-    }
-
-    setIsLoading(true);
-    try {
-      const response = await fetch("/api/bookmarks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sourceText: trimmedText,
-          sourceUrl: sourceUrl.trim() || undefined,
-          tweetId: tweetMeta?.tweetId ?? undefined,
-          tweetAuthorId: tweetMeta?.tweetAuthorId ?? undefined,
-          tweetCreatedAt: tweetMeta?.tweetCreatedAt ?? undefined,
-        }),
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string };
-        throw new Error(payload.error ?? "Failed to create bookmark.");
-      }
-
-      setSourceText("");
-      setSourceUrl("");
-      setTweetUrl("");
-      setImportError(null);
-      setTweetMeta(null);
-
-      await loadBookmarks();
-    } catch (submitError) {
-      console.error(submitError);
-      setError(
-        submitError instanceof Error
-          ? submitError.message
-          : "Something went wrong. Please try again."
-      );
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
   const connectWallet = async () => {
     setWalletError(null);
-
     if (!isMetaMaskInstalled()) {
-      setWalletError(
-        "MetaMask not detected. Make sure the MetaMask extension is enabled for this browser profile."
-      );
+      setWalletError("MetaMask not detected.");
       return;
     }
-
-    const injectedConnector = connectors[0];
-    if (!injectedConnector) {
+    const injected = connectors[0];
+    if (!injected) {
       setWalletError("No wallet connector available.");
       return;
     }
-
-    connect({ connector: injectedConnector });
+    connect({ connector: injected });
   };
 
   const switchToBscTestnet = async () => {
@@ -316,66 +395,102 @@ export default function Home() {
     try {
       await switchChainAsync({ chainId: expectedChainId });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to switch network.";
-      setWalletError(msg);
+      setWalletError(e instanceof Error ? e.message : "Failed to switch network.");
     }
   };
 
-  return (
-    <div className="dark min-h-screen bg-zinc-950 text-zinc-50">
-      {/* subtle background */}
-      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_at_top,rgba(99,102,241,0.18),transparent_55%),radial-gradient(ellipse_at_bottom,rgba(16,185,129,0.10),transparent_55%)]" />
+  const copyToClipboard = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      setError("Copy failed.");
+    }
+  };
 
-      <main className="relative mx-auto flex w-full max-w-4xl flex-col gap-8 px-4 py-10 sm:px-8 lg:px-10">
-        {/* Top header */}
-        <header className="flex flex-col gap-3">
-          <div className="flex items-end justify-between gap-4">
-            <div>
-              <h1 className="text-3xl font-semibold tracking-tight">BookmarkCT</h1>
-              <p className="mt-2 text-sm text-zinc-300">
-                Import X posts, generate AI summaries, and save the signal.
-              </p>
-            </div>
-            <div className="hidden sm:block">
-              <span className="rounded-full border border-zinc-800 bg-zinc-950/60 px-3 py-1 text-xs text-zinc-300">
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return bookmarks.filter((b) => {
+      const meta = classifySource(b);
+      if (activeFilter !== "all" && meta.kind !== activeFilter) return false;
+      if (!q) return true;
+
+      const hay = [
+        b.summary ?? "",
+        b.sourceText ?? "",
+        b.sourceUrl ?? "",
+        b.tweetAuthorId ?? "",
+        b.tweetId ?? "",
+      ]
+        .join("\n")
+        .toLowerCase();
+
+      return hay.includes(q);
+    });
+  }, [bookmarks, activeFilter, query]);
+
+  const counts = useMemo(() => {
+    const c = { all: bookmarks.length, tweet: 0, thread: 0, article: 0, text: 0 };
+    for (const b of bookmarks) {
+      const k = classifySource(b).kind;
+      c[k] += 1;
+    }
+    return c;
+  }, [bookmarks]);
+
+  return (
+    <div className="min-h-screen bg-radial-glow text-zinc-100">
+      {/* TOP NAV */}
+      <header className="sticky top-0 z-50">
+        <div className="mx-auto max-w-6xl px-6">
+        <div className="mt-4 glass-card rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">            <button
+              type="button"
+              onClick={() => scrollTo(heroRef)}
+              className="flex items-center gap-3"
+              aria-label="Go to top"
+            >
+              <div className="h-9 w-9 rounded-xl bg-white/10 soft-border flex items-center justify-center">
+                <div className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
+              </div>
+              <div className="text-left leading-tight">
+                <div className="text-sm font-semibold">BookmarkCT</div>
+                <div className="text-xs text-zinc-400">Signal vault</div>
+              </div>
+            </button>
+
+            <nav className="hidden sm:flex items-center gap-2">
+  <button
+    type="button"
+    onClick={() => scrollTo(actionRef)}
+    className={navPill(activeSection === "summarize")}
+  >
+    Summarize
+  </button>
+  <button
+    type="button"
+    onClick={() => scrollTo(vaultRef)}
+    className={navPill(activeSection === "vault")}
+  >
+    Vault
+  </button>
+</nav>
+
+            <div className="flex items-center gap-2">
+              <span className="hidden md:inline-flex rounded-full bg-white/5 soft-border px-3 py-1.5 text-xs text-zinc-300">
                 Demo mode
               </span>
-            </div>
-          </div>
-        </header>
 
-        {/* Wallet card */}
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-6 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] backdrop-blur">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Wallet</h2>
-              <p className="mt-1 text-xs text-zinc-400">
-                Connect MetaMask on BNB Smart Chain Testnet.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
               {isConnected ? (
                 <>
-                  <span className="rounded-full border border-zinc-800 bg-zinc-900/60 px-3 py-1 text-xs text-zinc-200">
-                    {address}
+                  <span className="hidden md:inline-flex rounded-full bg-emerald-500/10 soft-border px-3 py-1.5 text-xs text-emerald-200">
+                    {isOnExpectedChain ? "BSC Testnet" : "Wrong network"}
                   </span>
-
-                  {!isOnExpectedChain ? (
-                    <button
-                      type="button"
-                      onClick={switchToBscTestnet}
-                      disabled={isSwitchingChain}
-                      className="rounded-full bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-70"
-                    >
-                      {isSwitchingChain ? "Switching..." : "Switch to BSC Testnet"}
-                    </button>
-                  ) : null}
-
+                  <span className="inline-flex rounded-full bg-white/5 soft-border px-3 py-1.5 text-xs text-zinc-200">
+                    {truncateAddress(address)}
+                  </span>
                   <button
                     type="button"
                     onClick={() => disconnect()}
-                    className="rounded-full border border-zinc-800 bg-zinc-950/30 px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/40"
+                    className="rounded-full bg-white/5 soft-border px-3 py-1.5 text-xs text-zinc-200 hover:bg-white/10"
                   >
                     Disconnect
                   </button>
@@ -385,261 +500,472 @@ export default function Home() {
                   type="button"
                   onClick={connectWallet}
                   disabled={isConnecting}
-                  className="rounded-full bg-white px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-70"
+                  className="rounded-full bg-white px-4 py-1.5 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 disabled:opacity-70"
                 >
-                  {isConnecting ? "Connecting..." : "Connect Wallet"}
+                  {isConnecting ? "Connecting…" : "Connect"}
                 </button>
               )}
             </div>
           </div>
 
-          {connectError ? (
-            <p className="mt-3 text-xs text-red-400">{connectError.message}</p>
-          ) : null}
-          {walletError ? <p className="mt-3 text-xs text-red-400">{walletError}</p> : null}
-          {!isContractConfigured ? (
-            <p className="mt-3 text-xs text-amber-300">Deploy the contract first.</p>
-          ) : null}
-          {isConnected && !isOnExpectedChain ? (
-            <p className="mt-2 text-xs text-amber-300">
-              Wrong network. Expected BNB Smart Chain Testnet (chainId 97).
-            </p>
-          ) : null}
-        </section>
+          {(walletError || connectError) && (
+            <div className="mt-3 text-center text-xs text-red-300">
+              {walletError ?? connectError?.message ?? ""}
+            </div>
+          )}
 
-        {/* Import card */}
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-6 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] backdrop-blur">
+          {isConnected && !isOnExpectedChain && (
+            <div className="mt-3 text-center">
+              <button
+                type="button"
+                onClick={switchToBscTestnet}
+                disabled={isSwitchingChain}
+                className="rounded-full bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-900 disabled:opacity-70"
+              >
+                {isSwitchingChain ? "Switching…" : "Switch to BSC Testnet"}
+              </button>
+            </div>
+          )}
+        </div>
+      </header>
+
+      {/* HERO */}
+      <section ref={heroRef} className="mx-auto max-w-6xl px-6 pt-24 pb-12 text-center">
+      <div className="fade-up inline-flex items-center gap-2 rounded-full bg-white/5 soft-border px-4 py-2 text-xs text-zinc-300">
+          <span className="inline-block h-2 w-2 rounded-full bg-emerald-400" />
+          Import X, summarize, save signal
+        </div>
+
+        <h1 className="fade-up fade-up-delay-1 mt-8 text-5xl sm:text-6xl font-semibold tracking-tight text-glow">          Bookmark the signal, not the noise.
+        </h1>
+
+        <p className="fade-up fade-up-delay-2 mt-6 text-lg text-zinc-400 max-w-2xl mx-auto">          Turn long X posts, threads, and articles into concise AI summaries and save what matters.
+        </p>
+
+        <div className="fade-up fade-up-delay-3 mt-10 flex justify-center gap-3">          <button
+            type="button"
+            onClick={() => scrollTo(actionRef)}
+            className="rounded-full bg-white px-6 py-3 text-sm font-semibold text-zinc-900 hover:bg-zinc-200"
+          >
+            Summarize a post
+          </button>
+          <button
+            type="button"
+            onClick={() => scrollTo(vaultRef)}
+            className="rounded-full bg-white/5 soft-border px-6 py-3 text-sm font-semibold text-zinc-200 hover:bg-white/10"
+          >
+            View your vault
+          </button>
+        </div>
+
+        {/* FAST / SEARCHABLE / VERIFIABLE */}
+        <div className="mt-14 grid grid-cols-1 sm:grid-cols-3 gap-4 text-left">
+          {[
+            { t: "Fast", d: "Import and summarize in seconds" },
+            { t: "Searchable", d: "Find signals instantly" },
+            { t: "Verifiable", d: "Optional on-chain anchor" },
+          ].map((x) => (
+            <div key={x.t} className="glass-card rounded-2xl p-6">
+              <div className="text-sm font-semibold">{x.t}</div>
+              <div className="mt-2 text-sm text-zinc-400">{x.d}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* HOW IT WORKS */}
+      <section className="mx-auto max-w-6xl px-6 pb-12">
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+          {[
+            { t: "Paste X link or text", d: "Import in 1 click" },
+            { t: "AI summarizes content", d: "Short, dense signal" },
+            { t: "Save off-chain", d: "Instant and searchable" },
+            { t: "Optionally anchor on-chain", d: "Proof of integrity" },
+          ].map((s) => (
+            <div key={s.t} className="glass-card rounded-2xl p-6">
+              <div className="text-sm font-semibold">{s.t}</div>
+              <div className="mt-2 text-sm text-zinc-400">{s.d}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ACTION */}
+      <section ref={actionRef} className="mx-auto max-w-6xl px-6 py-10">
+        <div className="glass-card rounded-3xl p-8 sm:p-10">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Import from X</h2>
-              <p className="mt-1 text-xs text-zinc-400">
-                Paste a status URL and we&apos;ll fetch the post text automatically.
-              </p>
+              <div className="text-xl font-semibold">Summarize</div>
+              <div className="mt-2 text-sm text-zinc-400">
+                Paste text or import an X post, then generate an AI summary.
+              </div>
+            </div>
+            <div className="text-sm text-zinc-400">
+              {remainingChars.toString()} chars
             </div>
           </div>
 
-          <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-            <input
-              type="url"
-              value={tweetUrl}
-              onChange={(e) => setTweetUrl(e.target.value)}
-              className="w-full flex-1 rounded-xl border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-sm text-zinc-100 shadow-sm placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-800"
-              placeholder="https://x.com/<user>/status/<id>"
-            />
+          <div className="mt-8 flex gap-2">
             <button
               type="button"
-              onClick={handleImportFromX}
-              disabled={isImporting}
-              className="rounded-xl bg-white px-5 py-3 text-sm font-semibold text-zinc-950 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-70"
+              onClick={() => setMode("x")}
+              className={cx(
+                "rounded-full px-4 py-2 text-sm font-semibold",
+                mode === "x" ? "bg-white text-zinc-900" : "bg-white/5 soft-border text-zinc-200 hover:bg-white/10"
+              )}
             >
-              {isImporting ? "Importing..." : "Import"}
+              From X
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("text")}
+              className={cx(
+                "rounded-full px-4 py-2 text-sm font-semibold",
+                mode === "text" ? "bg-white text-zinc-900" : "bg-white/5 soft-border text-zinc-200 hover:bg-white/10"
+              )}
+            >
+              Paste text
             </button>
           </div>
 
-          {importError ? (
-            <div className="mt-3 rounded-xl border border-red-900/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
-              {importError}
-            </div>
-          ) : null}
-
-          {tweetMeta ? (
-            <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-xs text-zinc-300">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="font-semibold text-zinc-100">Tweet metadata</span>
-                <span className="text-zinc-500">id: {tweetMeta.tweetId}</span>
-              </div>
-              <div className="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-2">
-                <div>authorId: {tweetMeta.tweetAuthorId ?? "-"}</div>
-                <div>createdAt: {tweetMeta.tweetCreatedAt ?? "-"}</div>
-              </div>
-            </div>
-          ) : null}
-        </section>
-
-        {/* Create bookmark */}
-        <form
-          onSubmit={handleSubmit}
-          className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-6 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] backdrop-blur"
-        >
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Summarize</h2>
-              <p className="mt-1 text-xs text-zinc-400">
-                Paste text or import a post, then generate an AI summary.
-              </p>
-            </div>
+          <div className="mt-6">
+            {mode === "x" ? (
+              <>
+                <input
+                  value={tweetUrl}
+                  onChange={(e) => setTweetUrl(e.target.value)}
+                  placeholder="https://x.com/user/status/..."
+                  className="w-full rounded-2xl px-4 py-4 text-sm text-zinc-100 input-dark"
+                />
+                <button
+                  type="button"
+                  onClick={handleImportFromX}
+                  disabled={isImporting}
+                  className="mt-4 rounded-full bg-white px-6 py-3 text-sm font-semibold text-zinc-900 hover:bg-zinc-200 disabled:opacity-70"
+                >
+                  {isImporting ? "Importing…" : "Import"}
+                </button>
+                {importError && (
+                  <div className="mt-4 text-sm text-red-300">{importError}</div>
+                )}
+              </>
+            ) : (
+              <textarea
+                rows={6}
+                value={sourceText}
+                onChange={(e) => setSourceText(e.target.value)}
+                placeholder="Paste text to summarize…"
+                className="w-full rounded-2xl px-4 py-4 text-sm text-zinc-100 input-dark"
+              />
+            )}
           </div>
 
-          <div className="mt-4 space-y-4">
-            <div>
-              <label htmlFor="sourceText" className="text-xs font-medium text-zinc-300">
-                Source text
-              </label>
-              <textarea
-                id="sourceText"
-                name="sourceText"
-                rows={7}
-                value={sourceText}
-                onChange={(event) => setSourceText(event.target.value)}
-                maxLength={MAX_SOURCE_TEXT_LENGTH}
-                className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-sm text-zinc-100 shadow-sm placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-800"
-                placeholder="Paste text to summarize..."
-              />
-              <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
-                <span>{remainingChars} chars remaining</span>
-                <span className="rounded-full border border-zinc-800 bg-zinc-950/40 px-2 py-0.5">
-                  Max {MAX_SOURCE_TEXT_LENGTH.toLocaleString()}
-                </span>
-              </div>
-            </div>
+          <div className="mt-5">
+            <label className="text-xs text-zinc-400">Source URL (optional)</label>
+            <input
+              value={sourceUrl}
+              onChange={(e) => setSourceUrl(e.target.value)}
+              placeholder="https://example.com"
+              className="mt-2 w-full rounded-2xl px-4 py-3 text-sm text-zinc-100 input-dark"
+            />
+          </div>
 
-            <div>
-              <label htmlFor="sourceUrl" className="text-xs font-medium text-zinc-300">
-                Source URL (optional)
-              </label>
-              <input
-                id="sourceUrl"
-                name="sourceUrl"
-                type="url"
-                value={sourceUrl}
-                onChange={(event) => setSourceUrl(event.target.value)}
-                className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-sm text-zinc-100 shadow-sm placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-800"
-                placeholder="https://example.com"
-              />
-            </div>
-
-            {error ? (
-              <div className="rounded-xl border border-red-900/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
-                {error}
-              </div>
-            ) : null}
-
+          <form onSubmit={handleSubmit} className="mt-6">
             <button
               type="submit"
               disabled={isLoading}
-              className="inline-flex items-center justify-center rounded-xl bg-white px-5 py-3 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-70"
+              className="w-full rounded-2xl bg-emerald-500 px-6 py-4 text-sm font-semibold text-zinc-900 hover:bg-emerald-400 disabled:opacity-70"
             >
-              {isLoading ? "Summarizing..." : "Summarize & Save"}
+              {isLoading ? "Summarizing…" : "Generate summary"}
             </button>
-          </div>
-        </form>
+          </form>
 
-        {/* Saved bookmarks */}
-        <section className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-zinc-100">Saved bookmarks</h2>
-            <span className="text-xs text-zinc-400">{bookmarks.length} total</span>
+          {error && <div className="mt-4 text-sm text-red-300">{error}</div>}
+        </div>
+      </section>
+
+      {/* VAULT */}
+      <section ref={vaultRef} className="mx-auto max-w-6xl px-6 pb-24 pt-10">
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+          <div>
+            <h2 className="text-3xl font-semibold">Your signal vault</h2>
+            <p className="mt-2 text-sm text-zinc-400">
+              AI-compressed insights you chose to keep.
+            </p>
           </div>
 
-          {bookmarks.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-zinc-800 bg-zinc-950/40 p-10 text-center text-sm text-zinc-400">
-              No bookmarks yet. Add your first summary above.
+          <div className="flex items-center gap-3">
+            <div className="text-xs text-zinc-500">
+              {filtered.length} of {bookmarks.length} signals
+            </div>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search your vault…"
+              className="w-64 max-w-full rounded-full px-4 py-2 text-sm text-zinc-100 input-dark"
+            />
+          </div>
+        </div>
+
+        <div className="mt-6 flex flex-wrap gap-2">
+          {[
+            { k: "all", label: `All`, n: counts.all },
+            { k: "tweet", label: `Tweet`, n: counts.tweet },
+            { k: "thread", label: `Thread`, n: counts.thread },
+            { k: "article", label: `Article`, n: counts.article },
+            { k: "text", label: `Text`, n: counts.text },
+          ].map((x) => {
+            const active = activeFilter === (x.k as any);
+            return (
+              <button
+                key={x.k}
+                type="button"
+                onClick={() => setActiveFilter(x.k as any)}
+                className={cx(
+                  "rounded-full px-4 py-2 text-sm font-semibold",
+                  active
+                    ? "bg-white text-zinc-900"
+                    : "bg-white/5 soft-border text-zinc-200 hover:bg-white/10"
+                )}
+              >
+                {x.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-6">
+          {filtered.length === 0 ? (
+            <div className="glass-card rounded-3xl p-10 text-center">
+              <div className="text-sm font-semibold">No signals found</div>
+              <div className="mt-2 text-sm text-zinc-400">
+                Try another filter or search query.
+              </div>
             </div>
           ) : (
             <div className="space-y-4">
-              {bookmarks.map((bookmark) => {
-                const created = formatCreatedAtIso(bookmark.createdAt);
+              {filtered.map((b) => {
+                const created = formatCreatedAt(b.createdAt);
+                const meta = classifySource(b);
+                const isExpanded = Boolean(expandedById[b.id]);
+
+                const url = b.sourceUrl ?? "";
+                const host = url ? shortHost(url) : "manual";
+
+                const threadCount =
+                  meta.kind === "thread"
+                    ? Math.max(
+                        1,
+                        (b.sourceText ?? "")
+                          .split("\n")
+                          .filter((l) => l.trim().length > 0).length
+                      )
+                    : null;
+
+                const canSaveOnchain =
+                  isConnected &&
+                  isContractConfigured &&
+                  isOnExpectedChain &&
+                  txStates[b.id]?.status !== "wallet" &&
+                  txStates[b.id]?.status !== "pending";
 
                 return (
                   <article
-                    key={bookmark.id}
-                    className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-6 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] backdrop-blur"
-                  >
-                    <div className="flex flex-col gap-3">
-                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-zinc-200">
-                        {bookmark.summary}
-                      </p>
+  key={b.id}
+  className="group relative overflow-hidden rounded-3xl bg-white/5 soft-border p-7 shadow-[0_18px_70px_rgba(0,0,0,0.55)] transition hover:bg-white/7"
+>
+  {/* subtle sheen */}
+  <div className="pointer-events-none absolute inset-0 opacity-0 transition group-hover:opacity-100">
+    <div className="absolute -inset-[40%] rotate-12 bg-gradient-to-r from-transparent via-white/6 to-transparent" />
+  </div>
 
-                      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-zinc-400">
-                        <span className="rounded-full border border-zinc-800 bg-zinc-950/40 px-2 py-0.5">
-                          {created}
-                        </span>
+  {/* HEADER */}
+  <div className="relative flex flex-wrap items-center justify-between gap-3">
+    <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400">
+      <span className="inline-flex items-center gap-2 rounded-full bg-black/25 soft-border px-3 py-1.5 text-[11px] text-zinc-200">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        <span className="font-semibold">{meta.label}</span>
+        {meta.kind === "thread" && threadCount ? (
+          <span className="text-zinc-400">· {threadCount} lines</span>
+        ) : null}
+      </span>
 
-                        {bookmark.sourceUrl ? (
-                          <a
-                            href={bookmark.sourceUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="rounded-full border border-zinc-800 bg-zinc-950/40 px-2 py-0.5 text-zinc-200 hover:bg-zinc-900/40"
-                            title={bookmark.sourceUrl}
-                          >
-                            {shortenUrl(bookmark.sourceUrl)}
-                          </a>
-                        ) : null}
-                      </div>
+      <span className="text-zinc-600">·</span>
+      <span>{created}</span>
 
-                      {bookmark.tweetId ? (
-                        <div className="rounded-xl border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-xs text-zinc-300">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-semibold text-zinc-100">Tweet metadata</span>
-                            <span className="text-zinc-500">id: {bookmark.tweetId}</span>
-                          </div>
-                          <div className="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-2">
-                            <div>authorId: {bookmark.tweetAuthorId ?? "-"}</div>
-                            <div>createdAt: {bookmark.tweetCreatedAt ?? "-"}</div>
-                          </div>
-                        </div>
-                      ) : null}
+      {b.tweetAuthorId ? (
+        <>
+          <span className="text-zinc-600">·</span>
+          <span className="truncate">author {b.tweetAuthorId}</span>
+        </>
+      ) : null}
+    </div>
 
-                      <div className="mt-1 flex flex-col gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleSaveOnchain(bookmark)}
-                          disabled={
-                            !isConnected ||
-                            !isContractConfigured ||
-                            !isOnExpectedChain ||
-                            txStates[bookmark.id]?.status === "wallet" ||
-                            txStates[bookmark.id]?.status === "pending"
-                          }
-                          className={cx(
-                            "inline-flex items-center justify-center rounded-xl px-4 py-2 text-xs font-semibold transition",
-                            "border border-zinc-800 bg-zinc-950/30 text-zinc-200 hover:bg-zinc-900/40",
-                            "disabled:cursor-not-allowed disabled:opacity-60"
-                          )}
-                        >
-                          Save on-chain
-                        </button>
+    <div className="flex items-center gap-2">
+      {b.sourceUrl ? (
+        <button
+          type="button"
+          onClick={() => copyToClipboard(b.sourceUrl!)}
+          className="rounded-full bg-black/25 soft-border px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-black/35"
+        >
+          Copy link
+        </button>
+      ) : null}
 
-                        {txStates[bookmark.id]?.status === "wallet" ? (
-                          <span className="text-xs text-zinc-400">Confirm in wallet…</span>
-                        ) : null}
+      <button
+        type="button"
+        onClick={() => copyToClipboard(b.summary)}
+        className="rounded-full bg-black/25 soft-border px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-black/35"
+      >
+        Copy summary
+      </button>
+    </div>
+  </div>
 
-                        {txStates[bookmark.id]?.status === "pending" ? (
-                          <span className="text-xs text-zinc-400">Pending…</span>
-                        ) : null}
+  {/* SUMMARY */}
+  <div className="relative mt-5">
+    <div
+      className="text-[15px] leading-relaxed text-zinc-100"
+      style={
+        isExpanded
+          ? undefined
+          : {
+              display: "-webkit-box",
+              WebkitLineClamp: 5,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+            }
+      }
+    >
+      {b.summary}
+    </div>
 
-                        {txStates[bookmark.id]?.status === "success" ? (
-                          <a
-                            className="text-xs text-emerald-300 underline decoration-emerald-600/40 underline-offset-4"
-                            href={`https://testnet.bscscan.com/tx/${txStates[bookmark.id]?.hash}`}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            View transaction on BscScan
-                          </a>
-                        ) : null}
+    {!isExpanded ? (
+      <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-10 bg-gradient-to-t from-black/25 to-transparent" />
+    ) : null}
+  </div>
 
-                        {txStates[bookmark.id]?.status === "error" ? (
-                          <span className="text-xs text-red-300">
-                            {txStates[bookmark.id]?.error ?? "Transaction failed."}
-                          </span>
-                        ) : null}
+  {/* SOURCE */}
+  <div className="relative mt-3 text-xs text-zinc-500">
+    {b.sourceUrl ? (
+      <a
+        href={b.sourceUrl}
+        target="_blank"
+        rel="noreferrer"
+        className="underline decoration-zinc-700 underline-offset-4 hover:text-zinc-300"
+      >
+        {host}
+      </a>
+    ) : (
+      <span>manual</span>
+    )}
+  </div>
 
-                        {!isOnExpectedChain && isConnected ? (
-                          <span className="text-xs text-amber-300">
-                            Switch to BSC Testnet to save on-chain.
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                  </article>
+  {/* TRANSCRIPT */}
+  {b.sourceText && b.sourceText.trim().length > 0 ? (
+    <div className="relative mt-5 rounded-2xl bg-black/25 soft-border px-5 py-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-xs font-semibold text-zinc-200">
+          {isExpanded ? "Full transcript" : "Transcript preview"}
+        </div>
+        <div className="text-[11px] text-zinc-500">
+          {(b.sourceText?.length ?? 0).toLocaleString()} chars
+        </div>
+      </div>
+
+      <div
+        className={cx(
+          "mt-3 whitespace-pre-wrap text-xs leading-relaxed text-zinc-400",
+          isExpanded ? "max-h-80 overflow-auto pr-2" : ""
+        )}
+      >
+        {isExpanded ? b.sourceText : clampText(b.sourceText, 360)}
+      </div>
+    </div>
+  ) : null}
+
+  {/* FOOTER ACTIONS */}
+  <div className="relative mt-6 flex flex-wrap items-center gap-3">
+    <button
+      type="button"
+      onClick={() => toggleExpanded(b.id)}
+      className="rounded-full bg-black/25 soft-border px-5 py-2.5 text-xs font-semibold text-zinc-200 hover:bg-black/35"
+    >
+      {isExpanded ? "Collapse" : "Read more"}
+    </button>
+
+    <button
+      type="button"
+      onClick={() => handleSaveOnchain(b)}
+      disabled={!canSaveOnchain}
+      className="rounded-full border border-white/15 bg-transparent px-5 py-2.5 text-xs font-semibold text-zinc-200 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {txStates[b.id]?.status === "wallet"
+        ? "Confirm in wallet…"
+        : txStates[b.id]?.status === "pending"
+        ? "Saving on-chain…"
+        : "Save on-chain"}
+    </button>
+
+    {txStates[b.id]?.status === "success" ? (
+      <a
+        className="rounded-full bg-emerald-500/10 soft-border px-5 py-2.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/15"
+        href={`https://testnet.bscscan.com/tx/${txStates[b.id]?.hash}`}
+        target="_blank"
+        rel="noreferrer"
+      >
+        View on BscScan
+      </a>
+    ) : null}
+
+    {txStates[b.id]?.status === "error" ? (
+      <span className="text-xs text-red-300">
+        {txStates[b.id]?.error ?? "Transaction failed."}
+      </span>
+    ) : null}
+
+    {!isOnExpectedChain && isConnected ? (
+      <span className="text-xs text-amber-300">
+        Switch to BSC Testnet to save on-chain.
+      </span>
+    ) : null}
+  </div>
+</article>
                 );
               })}
             </div>
           )}
-        </section>
-      </main>
+        </div>
+      </section>
+
+      {/* FOOTER */}
+      <footer className="border-t border-white/10">
+        <div className="mx-auto max-w-6xl px-6 py-10 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+          <div className="text-sm text-zinc-300">
+            <div className="font-semibold">BookmarkCT</div>
+            <div className="mt-1 text-xs text-zinc-500">
+              Summaries saved off-chain, optional on-chain integrity anchor.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => scrollTo(actionRef)}
+              className="rounded-full bg-white/5 soft-border px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+            >
+              Summarize
+            </button>
+            <button
+              type="button"
+              onClick={() => scrollTo(vaultRef)}
+              className="rounded-full bg-white/5 soft-border px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+            >
+              Vault
+            </button>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
