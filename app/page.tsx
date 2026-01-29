@@ -251,23 +251,39 @@ export default function Home() {
   const handleImportFromX = async () => {
     setImportError(null);
     setError(null);
-
+  
     if (!tweetUrl.trim()) {
       setImportError("Paste an X status URL first.");
       return;
     }
-
+  
     setIsImporting(true);
+  
     try {
       const res = await fetch(`/api/tweet?url=${encodeURIComponent(tweetUrl)}`);
-      const payload = (await res.json()) as TweetApiOk | TweetApiErr;
-
-      if (!res.ok || !payload.ok) {
-        throw new Error(
-          "ok" in payload ? "Import failed." : payload.error ?? "Import failed."
-        );
+  
+      type ImportResponse =
+        | {
+            ok: true;
+            url: string;
+            id: string;
+            text: string;
+            authorId: string | null;
+            createdAt: string | null;
+          }
+        | {
+            ok: false;
+            error?: string;
+          };
+  
+      const payload: ImportResponse = await res.json();
+  
+      if (!res.ok || payload.ok === false) {
+        const msg =
+          payload.ok === false && payload.error ? payload.error : "Import failed.";
+        throw new Error(msg);
       }
-
+  
       setSourceText(payload.text);
       setSourceUrl(payload.url);
       setTweetMeta({
